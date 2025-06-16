@@ -6,7 +6,7 @@ from flask import Flask
 
 app = Flask(__name__)
 
-APP_SCRIPT = "main.py"
+APP_SCRIPT = "app.py"
 CHECK_INTERVAL = 300  # 5 minutes
 process = None
 
