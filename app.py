@@ -3,19 +3,58 @@ from telebot import types
 import requests
 import time
 import threading
+import schedule
 from datetime import datetime
-import firebase
-
-# Initialize Firebase
-FIREBASE_URL = "https://bkldost-default-rtdb.firebaseio.com/"
-firebase = firebase.FirebaseApplication(FIREBASE_URL, None)
 
 # Initialize Telegram Bot
 bot = telebot.TeleBot("8039732483:AAELszNcgl0saq6LKVAT0Dr5rPZJEPEi2Q4")
 
+# Firebase Configuration
+FIREBASE_BASE_URL = "https://bkldost-default-rtdb.firebaseio.com"
+MAX_RETRIES = 3
+RETRY_DELAY = 1  # seconds
+
 # States for conversation handler
 NAME, URL, INTERVAL = range(3)
 user_data = {}
+
+# ====================== FIREBASE UTILITY FUNCTIONS ======================
+
+def read_firebase(path, default=None):
+    url = f"{FIREBASE_BASE_URL}/{path}.json"
+    for attempt in range(MAX_RETRIES):
+        try:
+            res = requests.get(url, timeout=10)
+            if res.status_code == 200:
+                return res.json() if res.json() is not None else default
+            elif res.status_code == 404:
+                return default
+        except requests.exceptions.RequestException as e:
+            print(f"Firebase read error ({path}) attempt {attempt + 1}: {str(e)}")
+        time.sleep(RETRY_DELAY)
+    return default
+
+def write_firebase(path, data, merge=False):
+    url = f"{FIREBASE_BASE_URL}/{path}.json"
+    if merge:
+        url += "?print=silent"
+    
+    method = requests.patch if merge else requests.put
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            res = method(url, json=data, timeout=10)
+            if res.status_code in [200, 204]:
+                return True
+        except requests.exceptions.RequestException as e:
+            print(f"Firebase write error ({path}) attempt {attempt + 1}: {str(e)}")
+        time.sleep(RETRY_DELAY)
+    return False
+
+def update_firebase(path, updates):
+    return write_firebase(path, updates, merge=True)
+
+# ====================== BOT FUNCTIONS ======================
 
 # Keyboard layouts
 def create_main_keyboard():
@@ -45,9 +84,8 @@ def handle_main_menu(message):
 
 def process_username_step(message):
     username = message.text
-    # Check if user exists in Firebase
-    user = firebase.get('/users', None)
-    if user and username in user:
+    user = read_firebase(f'users/{username}')
+    if user:
         msg = bot.send_message(message.chat.id, "Please enter your password:")
         bot.register_next_step_handler(msg, process_password_step, username)
     else:
@@ -55,19 +93,16 @@ def process_username_step(message):
 
 def process_password_step(message, username):
     password = message.text
-    # Verify password from Firebase
-    user = firebase.get(f'/users/{username}', None)
-    if user and user['password'] == password:
+    user = read_firebase(f'users/{username}')
+    if user and user.get('password') == password:
         bot.send_message(message.chat.id, f"Welcome back, {username}!", reply_markup=create_monitor_keyboard())
-        # Store current user in temporary storage
         user_data[message.chat.id] = {'username': username}
     else:
         bot.send_message(message.chat.id, "Incorrect password. Please try again.", reply_markup=create_main_keyboard())
 
 def process_register_username_step(message):
     username = message.text
-    # Check if username already exists
-    user = firebase.get(f'/users/{username}', None)
+    user = read_firebase(f'users/{username}')
     if user:
         bot.send_message(message.chat.id, "Username already exists. Please choose another one.", reply_markup=create_main_keyboard())
     else:
@@ -76,13 +111,23 @@ def process_register_username_step(message):
 
 def process_register_password_step(message, username):
     password = message.text
-    # Save new user to Firebase
-    firebase.put('/users', username, {'password': password, 'monitors': {}})
-    bot.send_message(message.chat.id, "Registration successful! You can now login.", reply_markup=create_main_keyboard())
+    user_data = {
+        'password': password,
+        'monitors': {},
+        'chat_id': message.chat.id  # Store chat ID for notifications
+    }
+    if write_firebase(f'users/{username}', user_data):
+        bot.send_message(message.chat.id, "Registration successful! You can now login.", reply_markup=create_main_keyboard())
+    else:
+        bot.send_message(message.chat.id, "Registration failed. Please try again.", reply_markup=create_main_keyboard())
 
 # Handle monitor options
 @bot.message_handler(func=lambda message: message.text in ["Add Monitor", "My Monitors"])
 def handle_monitor_options(message):
+    if message.chat.id not in user_data:
+        bot.send_message(message.chat.id, "Please login first.", reply_markup=create_main_keyboard())
+        return
+        
     if message.text == "Add Monitor":
         msg = bot.send_message(message.chat.id, "Enter a name for your monitor:")
         bot.register_next_step_handler(msg, process_monitor_name_step)
@@ -106,7 +151,6 @@ def process_monitor_interval_step(message):
         monitor_name = user_data[message.chat.id]['monitor_name']
         monitor_url = user_data[message.chat.id]['monitor_url']
         
-        # Save monitor to Firebase
         monitor_data = {
             'url': monitor_url,
             'interval': interval,
@@ -116,23 +160,17 @@ def process_monitor_interval_step(message):
             'downtime': 0
         }
         
-        firebase.put(f'/users/{username}/monitors', monitor_name, monitor_data)
-        
-        bot.send_message(message.chat.id, f"Monitor '{monitor_name}' added successfully!", reply_markup=create_monitor_keyboard())
-        
-        # Start monitoring in background
-        start_monitoring(username, monitor_name, monitor_url, interval)
-        
+        if write_firebase(f'users/{username}/monitors/{monitor_name}', monitor_data):
+            bot.send_message(message.chat.id, f"Monitor '{monitor_name}' added successfully!", reply_markup=create_monitor_keyboard())
+            start_monitoring(username, monitor_name, monitor_url, interval, message.chat.id)
+        else:
+            bot.send_message(message.chat.id, "Failed to save monitor. Please try again.", reply_markup=create_monitor_keyboard())
     except ValueError:
         bot.send_message(message.chat.id, "Please enter a valid number for the interval.")
 
 def show_user_monitors(message):
-    if message.chat.id not in user_data:
-        bot.send_message(message.chat.id, "Please login first.", reply_markup=create_main_keyboard())
-        return
-    
     username = user_data[message.chat.id]['username']
-    monitors = firebase.get(f'/users/{username}/monitors', None)
+    monitors = read_firebase(f'users/{username}/monitors', {})
     
     if not monitors:
         bot.send_message(message.chat.id, "You don't have any monitors yet.", reply_markup=create_monitor_keyboard())
@@ -151,13 +189,13 @@ def check_url(url):
     except:
         return "🔴 DOWN"
 
-def start_monitoring(username, monitor_name, url, interval_minutes):
+def start_monitoring(username, monitor_name, url, interval_minutes, chat_id):
     def monitor_job():
         status = check_url(url)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # Get current monitor data
-        monitor_data = firebase.get(f'/users/{username}/monitors/{monitor_name}', None)
+        monitor_path = f'users/{username}/monitors/{monitor_name}'
+        monitor_data = read_firebase(monitor_path, {})
         
         # Update statistics
         if status == "🟢 UP":
@@ -165,23 +203,19 @@ def start_monitoring(username, monitor_name, url, interval_minutes):
         else:
             monitor_data['downtime'] = monitor_data.get('downtime', 0) + 1
         
-        # Update last status
+        # Check for status change
+        old_status = monitor_data.get('last_status')
         monitor_data['last_status'] = status
         monitor_data['last_checked'] = now
         
-        # Save back to Firebase
-        firebase.put(f'/users/{username}/monitors', monitor_name, monitor_data)
-        
-        # Notify user if status changed
-        if 'last_status' in monitor_data and monitor_data['last_status'] != status:
-            # You would need to find the user's chat ID here - this is a simplified version
-            # In a real implementation, you'd need to store chat IDs with user data
-            pass
+        if update_firebase(monitor_path, monitor_data):
+            if old_status and old_status != status:
+                bot.send_message(chat_id, f"Status changed for {monitor_name}:\n{old_status} → {status}")
     
     # Schedule the job
     schedule.every(interval_minutes).minutes.do(monitor_job)
     
-    # Run the scheduler in a separate thread
+    # Run scheduler in background
     def run_scheduler():
         while True:
             schedule.run_pending()
